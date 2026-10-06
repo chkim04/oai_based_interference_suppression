@@ -29,3 +29,6 @@ CMakeUserPresets.json
 
 # Local uplink I/Q experiment captures
 /common/utils/T/tracer/tp_uplink_rx_data_wireless_*
+
+# Local software registration draft
+/software_registration_form_draft.md
