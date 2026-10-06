@@ -9,6 +9,11 @@ ID = USRP_RX_ANT0
     GROUP = ALL:HEAVY
     FORMAT = int,timestap : buffer,data
 
+ID = USRP_RX_ANT1
+    DESC = RX IQ data as received by USRP driver on antenna 1
+    GROUP = ALL:HEAVY
+    FORMAT = int,timestap : buffer,data
+    
 ID = USRP_TX_ANT0
     DESC = TX IQ data as sent by USRP driver on antenna 0
     GROUP = ALL:HEAVY

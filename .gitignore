@@ -26,3 +26,6 @@ nfapi_nr_interface_scf
 *.log
 *.out
 CMakeUserPresets.json
+
+# Local uplink I/Q experiment captures
+/common/utils/T/tracer/tp_uplink_rx_data_wireless_*

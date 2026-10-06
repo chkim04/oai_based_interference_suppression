@@ -28,6 +28,7 @@
 #include <linux/sched.h>
 #include <sys/sysinfo.h>
 #include <math.h>
+#include <omp.h>
 
 #include "common/utils/nr/nr_common.h"
 #include "common/utils/assertions.h"
@@ -68,6 +69,13 @@ static int DEFRUTPCORES[] = {-1,-1,-1,-1};
 #include "nfapi_interface.h"
 #include <nfapi/oai_integration/vendor_ext.h>
 #include "executables/nr-softmodem-common.h"
+
+#include "reconstruction_test.h"
+#include "reconstruction_test_multi.h"
+
+void apply_rotation(RU_t* ru, int start_idx, int length, uint64_t timestamp_rx, int sym_offset, double f_offset);
+void apply_derotation(RU_t* ru, int start_idx, int length, uint64_t timestamp_rx, int sym_offset, double f_offset);
+void apply_spatial_filtering(RU_t* ru, int start_idx, int length);
 
 static void NRRCconfig_RU(configmodule_interface_t *cfg);
 
@@ -1201,7 +1209,11 @@ void *ru_thread(void *param)
       }
     }
   }
-
+  
+  // -------------------------------------------------------------------------------
+  // 초기화 함수 while loop 전에
+  init_reconstruction_fast();
+  
   // This is a forever while loop, it loops over subframes which are scheduled by incoming samples from HW devices
   struct timespec slot_start;
 	clock_gettime(CLOCK_MONOTONIC, &slot_start);
@@ -1258,10 +1270,188 @@ void *ru_thread(void *param)
     // do RX front-end processing (frequency-shift, dft) if needed
     int slot_type = nr_slot_select(&ru->config, proc->frame_rx, proc->tti_rx);
     if (slot_type == NR_UPLINK_SLOT || slot_type == NR_MIXED_SLOT) {
+       
+       
+       // 보상하고자 하는 주파수 오프셋 설정 (예: 간섭 신호가 -5MHz에 있다면 -5000000.0)
+        double f_offset = 16920000.0;
+        //double f_offset = 0.0; 
+
+        // [구조 병합] Cache Locality와 파이프라인 효율을 위해
+        // 안테나 루프를 제거하고, '심볼' 단위 병렬 루프 하나로 모든 과정을 처리합니다.
+        #pragma omp parallel for 
+        for (int sym = 0; sym < fp->symbols_per_slot; sym++) {
+            
+            // 1. 인덱스 및 심볼 오프셋 계산 (사용자 원본 로직 동일)
+            int start_idx = fp->get_samples_slot_timestamp(proc->tti_rx, fp, 0);
+
+            int sym_offset_samples = 0;
+            for(int s = 0; s < sym; s++) {
+                sym_offset_samples += fp->ofdm_symbol_size + ((s == 0) ? fp->nb_prefix_samples0 : fp->nb_prefix_samples);
+            }
+            start_idx += sym_offset_samples;
+
+            int sym_len = fp->ofdm_symbol_size + ((sym == 0) ? fp->nb_prefix_samples0 : fp->nb_prefix_samples);
+
+            // ==========================================================
+            // 파이프라인 시작 (데이터가 L1/L2 캐시에 올라온 상태)
+            // ==========================================================
+
+            // 2. [Pre-rotation] 간섭 신호를 타겟 주파수(DC)로 이동 (+Δf)
+            // 내부적으로 ANT0, ANT1 데이터를 모두 회전시킵니다.
+            //apply_rotation(ru, start_idx, sym_len, proc->timestamp_rx, sym_offset_samples, f_offset);
+
+            // 3. [Reconstruction] Folding된 신호 복원
+            if (ru->nb_rx > 0) {
+                c16_t* raw_buffer0 = (c16_t*)ru->common.rxdata[0];
+                run_fast_real_experiment(&raw_buffer0[start_idx], sym_len, 0);
+            }
+            if (ru->nb_rx > 1) {
+                c16_t* raw_buffer1 = (c16_t*)ru->common.rxdata[1];
+                run_fast_real_experiment(&raw_buffer1[start_idx], sym_len, 1);
+            }
+
+            // 4. [Spatial Filtering] 간섭 신호 완벽 제거
+            // 필터링 결과는 ANT0 버퍼에 덮어씌워지고, ANT1은 0으로 초기화됨
+            if (ru->nb_rx > 1) {
+                apply_spatial_filtering(ru, start_idx, sym_len);
+            }
+
+            // 5. [De-rotation] 5G 신호를 원래 주파수 대역으로 복귀 (-Δf)
+            // 결과가 담긴 ANT0(rxdata[0])에만 역회전을 걸어 정상 대역으로 돌려놓음
+            //apply_derotation(ru, start_idx, sym_len, proc->timestamp_rx, sym_offset_samples, f_offset);
+            
+            // ==========================================================
+            // 파이프라인 종료 -> 이후 정상적으로 feprx(FFT) 진행됨
+            // ==========================================================
+        }
+        
+        
+    /* //before rotation implementation
+    // Loop over antennas
+    // PARALLEL LOOP: Run Antennas simultaneously on different Cores
+    // "blocks" waits for all threads to finish before moving to FFT
+            //#pragma omp parallel for collapse(2)
+            for (int ant = 0; ant < ru->nb_rx; ant++) {
+         
+                c16_t* raw_buffer = (c16_t*)ru->common.rxdata[ant];
+                // Loop over 14 OFDM Symbols
+                #pragma omp parallel for collapse(1)
+                for (int sym = 0; sym < fp->symbols_per_slot; sym++) {
+                    
+                    
+                    int start_idx = fp->get_samples_slot_timestamp(proc->tti_rx, fp, 0);
+                    
+                    // Add symbol offset
+                    int sym_offset_samples = 0;
+                    for(int s=0; s<sym; s++) {
+                        sym_offset_samples += fp->ofdm_symbol_size + ((s==0)?fp->nb_prefix_samples0:fp->nb_prefix_samples);
+                    }
+                    start_idx += sym_offset_samples;
+
+                    int sym_len = fp->ofdm_symbol_size + ((sym==0)?fp->nb_prefix_samples0:fp->nb_prefix_samples);
+                    
+                    //uint32_t chunk_timestamp = (uint32_t)(proc->timestamp_rx + sym_offset_samples);
+
+                    // --- RUN REAL EXPERIMENT ---
+                    // No offset needed, just pointer and length
+                    //run_real_interference_experiment(&raw_buffer[start_idx], sym_len, chunk_timestamp);
+                    run_fast_real_experiment(&raw_buffer[start_idx], sym_len, ant);
+                }
+            }
+            
+            // ==============================================================
+	    // [추가할 위치] Spatial Filtering
+            // 모든 안테나의 Reconstruction이 끝난 이 시점에 필터링을 수행합니다.
+            // ==============================================================
+	
+	if (ru->nb_rx > 0) { // 안테나가 2개 이상일 때만 동작
+	    
+	    // 심볼 단위로 루프를 돌며 필터링 수행
+	    // (OpenMP를 써도 되지만, 안테나 간 의존성이 있으므로 심볼만 병렬화)
+	    #pragma omp parallel for 
+	    for (int s = 0; s < fp->symbols_per_slot; s++) {
+		
+		// 인덱스 다시 계산 (위 루프와 동일한 로직)
+		int start_idx = fp->get_samples_slot_timestamp(proc->tti_rx, fp, 0);
+		int sym_len = fp->ofdm_symbol_size + fp->nb_prefix_samples0; 
+		if (s > 0) sym_len = fp->ofdm_symbol_size + fp->nb_prefix_samples;
+		
+		// 오프셋 계산 (Prefix 고려)
+		int sym_offset = 0;
+		for (int k=0; k<s; k++) {
+		     sym_offset += (k==0 ? fp->nb_prefix_samples0 : fp->nb_prefix_samples) + fp->ofdm_symbol_size;
+		}
+		start_idx += sym_offset;
+
+		// [핵심] 필터링 함수 호출
+		// ANT0와 ANT1의 데이터를 읽어서 처리함
+		apply_spatial_filtering(ru, start_idx, sym_len);
+	    }
+	}
+        */ // before rotation implementation
+        
+            // when we want to extract only uplink slots
+            /*
+            if (ru->nb_rx > 0) {
+            	
+            	// 1. Calculate buffer size in bytes
+            	// (samples_per_slot * 4 bytes per sample for 16-bit I/Q)
+            	int samples_in_slot = fp->get_samples_per_slot(proc->tti_rx, fp);
+            	int num_bytes = samples_in_slot * 4;
+            	
+            	int slot_start_idx = fp->get_samples_slot_timestamp(proc->tti_rx, fp, 0);
+            	// 2. Call the T macro
+            	// We use 'proc->timestamp_rx' to keep the timing info correct
+            	T(T_USRP_RX_ANT0,
+            	  T_INT(proc->timestamp_rx),
+            	  T_BUFFER(&ru->common.rxdata[0][slot_start_idx], num_bytes));
+            }
+            */
+      //*/
+      
       if (!wait_free_rx_tti(&gNB->L1_rx_out, rx_tti_busy, proc->frame_rx, proc->tti_rx))
         break; // nothing to wait for: we have to stop
       if (ru->feprx) {
         ru->feprx(ru,proc->tti_rx);
+        
+        /*
+        // For Notching!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        // In executables/nr-ru.c inside ru_thread...
+
+	// ... (After feprx / FFT) ...
+    
+	    // Config: Notch range +/- 5 bins around DC
+	    int notch_radius = 5*12; 
+
+	    // Loop over Antennas
+	    for (int ant = 0; ant < ru->nb_rx; ant++) {
+		c16_t* fft_buffer = (c16_t*)ru->common.rxdataF[ant];
+		int symbol_size = fp->ofdm_symbol_size; // e.g., 2048
+
+		// Loop over Symbols
+		for (int sym = 0; sym < fp->symbols_per_slot; sym++) {
+		    
+		    int sym_offset = sym * symbol_size;
+		    c16_t* sym_data = &fft_buffer[sym_offset];
+
+		    // 1. Kill Positive Frequencies (DC to +5)
+		    // Indices: 0, 1, 2, 3, 4, 5
+		    for (int k = 0; k <= notch_radius; k++) {
+		        sym_data[k].r = 0;
+		        sym_data[k].i = 0;
+		    }
+
+		    // 2. Kill Negative Frequencies (-5 to -1)
+		    // In OAI FFT, -1 is at index (N-1), -5 is at (N-5)
+		    // Indices: 2043, 2044, 2045, 2046, 2047 (if N=2048)
+		    for (int k = symbol_size - notch_radius; k < symbol_size; k++) {
+		        sym_data[k].r = 0;
+		        sym_data[k].i = 0;
+		    }
+		}
+	    }
+	  */  
+	    
         LOG_D(NR_PHY, "Setting %d.%d (%d) to busy\n", proc->frame_rx, proc->tti_rx, proc->tti_rx % RU_RX_SLOT_DEPTH);
         //LOG_M("rxdata.m","rxs",ru->common.rxdata[0],1228800,1,1);
         LOG_D(PHY,"RU proc: frame_rx = %d, tti_rx = %d\n", proc->frame_rx, proc->tti_rx);
@@ -1306,6 +1496,30 @@ void *ru_thread(void *param)
         } // end if (prach_id >= 0)
       } // end if (ru->feprx)
     } // end if (slot_type == NR_UPLINK_SLOT || slot_type == NR_MIXED_SLOT) {
+
+    // for whold TDD pattern
+    
+    
+    if (ru->nb_rx > 0) {
+            	
+            	// 1. Calculate buffer size in bytes
+            	// (samples_per_slot * 4 bytes per sample for 16-bit I/Q)
+            	int samples_in_slot = fp->get_samples_per_slot(proc->tti_rx, fp);
+            	int num_bytes = samples_in_slot * 4;
+            	
+            	int slot_start_idx = fp->get_samples_slot_timestamp(proc->tti_rx, fp, 0);
+            	// 2. Call the T macro
+            	// We use 'proc->timestamp_rx' to keep the timing info correct
+            	T(T_USRP_RX_ANT0,
+            	  T_INT(proc->timestamp_rx),
+            	  T_BUFFER(&ru->common.rxdata[0][slot_start_idx], num_bytes));
+            	  
+            	T(T_USRP_RX_ANT1,
+            	  T_INT(proc->timestamp_rx),
+            	  T_BUFFER(&ru->common.rxdata[1][slot_start_idx], num_bytes));  
+            }
+           
+            
 
     notifiedFIFO_elt_t *resTx = newNotifiedFIFO_elt(sizeof(processingData_L1tx_t), 0, &gNB->L1_tx_out, NULL);
     processingData_L1tx_t *syncMsgTx = NotifiedFifoData(resTx);

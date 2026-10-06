@@ -659,7 +659,7 @@ void nr_ue_ulsch_procedures(PHY_VARS_NR_UE *UE,
       y_offset = y_offset + nb_re_pusch;
 
       LOG_D(PHY, "Transform precoding being done on data- symbol: %d, nb_re_pusch: %d, y_offset: %d\n", l, nb_re_pusch, y_offset);
-
+      
 #ifdef DEBUG_PUSCH_MAPPING
       printf("NR_ULSCH_UE: y_offset %u\t nb_re_pusch %u \t Symbol %d \t nb_rb %d \n", y_offset, nb_re_pusch, l, nb_rb);
 #endif

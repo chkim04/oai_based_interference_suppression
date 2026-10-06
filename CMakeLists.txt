@@ -1817,6 +1817,8 @@ add_executable(nr-softmodem
   ${OPENAIR_DIR}/executables/nr-gnb.c
   ${OPENAIR_DIR}/executables/nr-ru.c
   ${OPENAIR_DIR}/executables/nr-softmodem.c
+  ${OPENAIR_DIR}/executables/reconstruction_test.c
+  ${OPENAIR_DIR}/executables/reconstruction_test_multi.c
   ${OPENAIR_DIR}/executables/softmodem-common.c
   ${OPENAIR_DIR}/radio/COMMON/common_lib.c
   ${OPENAIR_DIR}/radio/COMMON/record_player.c
@@ -1825,6 +1827,20 @@ add_executable(nr-softmodem
   ${PHY_INTERFACE_DIR}/queue_t.c
   ${OPENAIR1_DIR}/PHY/TOOLS/phy_scope_interface.c
   )
+
+# 1. Find OpenMP Package
+find_package(OpenMP)
+
+# 2. Link OpenMP to nr-softmodem if found
+if (OpenMP_C_FOUND)
+  message(STATUS "OpenMP FOUND - Enabling Paralle Processing")
+  target_link_libraries(nr-softmodem PRIVATE OpenMP::OpenMP_C)
+  
+  # Also add the compile flags explicitly just to be safe
+  target_compile_options(nr-softmodem PRIVATE ${OpenMP_C_FLAGS})
+else()
+  message(WARNING "OpenMP NOT FOUND - Reconstruction will be slow!")
+endif()  
 
 target_link_libraries(nr-softmodem PRIVATE
   -Wl,--start-group
